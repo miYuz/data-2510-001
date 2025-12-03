@@ -1,0 +1,911 @@
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import Plot from 'react-plotly.js';
+import * as d3 from 'd3';
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import { marked } from "marked";
+import { Upload, Activity, ShieldCheck, BarChart2, MessageSquare, Info, Link as LinkIcon, RefreshCw } from 'lucide-react';
+
+// --- Configuration & Constants ---
+const EMBEDDED_KEY = "AIzaSyBsVO5pVlNt78seB7xpP67_sOvbosuCAWc";
+
+// [設定您的自動化 CSV 網址]
+// 方法：將 CSV 上傳至 GitHub -> 點擊 Raw -> 複製網址
+// 注意：GitHub Raw URL 有 1-5 分鐘的快取延遲，這是正常的。
+// 如果您還沒有網址，請保持空字串，App 會使用範例資料或等待上傳。
+const REMOTE_CSV_URL = "https://raw.githubusercontent.com/miYuz/data-0001/refs/heads/main/txf_result.csv"; 
+// 範例: "https://raw.githubusercontent.com/Username/Repo/main/txf_result.csv"
+
+const DEFAULT_LOCAL_FILE = 'txf_result.csv';
+
+const COLORS = {
+  bg: '#F7F5F2',
+  card: '#FFFFFF',
+  text: '#4A4A4A',
+  subText: '#8C8C8C',
+  portfolio: '#D69E2E', // Gold
+  benchmark: '#2D3748', // Dark Blue
+  positive: '#38A169',
+  negative: '#E53E3E',
+  safeLine: '#E53E3E',
+  inputBg: '#F8FAFC',
+  border: '#E2E8F0'
+};
+
+// --- Helper Functions ---
+const getWeekNumber = (d) => {
+  d = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay()||7));
+  var yearStart = new Date(Date.UTC(d.getUTCFullYear(),0,1));
+  var weekNo = Math.ceil(( ( (d - yearStart) / 86400000) + 1)/7);
+  return d.getUTCFullYear() + "-" + weekNo;
+};
+
+// --- Main App Component ---
+export default function App() {
+  // --- State ---
+  const [rawData, setRawData] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [activeTab, setActiveTab] = useState('sim'); // sim, monitor, ai, intro
+  const [dataSrcType, setDataSrcType] = useState('none'); // 'local', 'remote', 'upload'
+  
+  // Settings
+  const [config, setConfig] = useState({
+    initCapital: 1000000,
+    multiplier: 50, // 50 (MTX) or 200 (TX)
+    useFixedLev: false,
+    targetLev: 6,
+    safeFactor: 10,
+    w_ceo_l: 4,
+    w_ceo_s: 2,
+    w_kama: 1,
+    w_bench: 4,
+    timeRange: 'ALL' // ALL, 3Y, 2Y, 1Y, YTD, 6M
+  });
+
+  // AI State
+  const [apiKey, setApiKey] = useState(() => {
+      try {
+          return localStorage.getItem('gemini_api_key') || EMBEDDED_KEY;
+      } catch (e) {
+          return EMBEDDED_KEY;
+      }
+  });
+  const [chatInput, setChatInput] = useState("");
+  const [chatHistory, setChatHistory] = useState([
+    { role: 'ai', text: '你好！我是你的量化策略顧問。我可以幫你分析策略表現，或者回答關於回撤、槓桿和風險的問題。請嘗試點擊上方的「產生策略健檢報告」，或者直接問我問題！' }
+  ]);
+  const [aiLoading, setAiLoading] = useState(false);
+
+  // --- Data Loading ---
+  const processCSV = (data) => {
+      // Clean BOM and parse numbers
+      return data.map(row => {
+        let newRow = {};
+        for (let k in row) {
+          let cleanKey = k.trim().replace(/^\ufeff/, '');
+          newRow[cleanKey] = row[k]; 
+        }
+        return newRow;
+      });
+  };
+
+  const loadData = async (source, type) => {
+    setLoading(true);
+    setError(null);
+    try {
+      let data;
+      // Timestamp to bust cache
+      const cacheBuster = '?t=' + new Date().getTime();
+
+      if (type === 'upload') {
+        const text = await source.text();
+        data = d3.csvParse(text);
+      } else if (type === 'remote') {
+        data = await d3.csv(source + cacheBuster);
+      } else {
+        // Local relative path
+        data = await d3.csv(source + cacheBuster);
+      }
+
+      if (!data || data.length === 0) throw new Error("CSV 為空或格式錯誤");
+
+      const cleanData = processCSV(data);
+      setRawData(cleanData);
+      setDataSrcType(type);
+    } catch (err) {
+      console.error(err);
+      if (type === 'remote') {
+          setError(`無法從 GitHub 讀取資料。請確認網址正確且 Repository 為 Public。(${err.message})`);
+      } else {
+          setError(err.message);
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Initial Load Strategy
+  useEffect(() => {
+    if (REMOTE_CSV_URL) {
+        // If user configured a remote URL, try that first
+        loadData(REMOTE_CSV_URL, 'remote');
+    } else {
+        // Fallback to local file (if running on python server)
+        loadData(DEFAULT_LOCAL_FILE, 'local').catch(() => {
+            // If local fails, just wait for upload
+            console.log("No default data found.");
+        });
+    }
+  }, []);
+
+  // --- Backtest Engine ---
+  const simulationResults = useMemo(() => {
+    if (rawData.length === 0) return null;
+
+    // 1. Filter Data by Time Range
+    let simData = [...rawData];
+    if (config.timeRange !== 'ALL') {
+      const lastDate = new Date(rawData[rawData.length - 1].ts);
+      let startDate = new Date(lastDate);
+      switch(config.timeRange) {
+        case 'YTD': startDate = new Date(lastDate.getFullYear(), 0, 1); break;
+        case '6M': startDate.setMonth(startDate.getMonth() - 6); break;
+        case '1Y': startDate.setFullYear(startDate.getFullYear() - 1); break;
+        case '2Y': startDate.setFullYear(startDate.getFullYear() - 2); break;
+        case '3Y': startDate.setFullYear(startDate.getFullYear() - 3); break;
+        default: break;
+      }
+      simData = rawData.filter(d => new Date(d.ts) >= startDate);
+    }
+
+    if (simData.length === 0) return null;
+
+    const times = simData.map(d => d.ts);
+    let benchKey = 'TXF_caa';
+    if (!simData[0].hasOwnProperty('TXF_caa')) {
+        if (simData[0].hasOwnProperty('TXF_abs')) benchKey = 'TXF_abs';
+        else benchKey = null;
+    }
+
+    // 2. Initialize Variables
+    let currPortEquity = config.initCapital;
+    let currBenchEquity = config.initCapital;
+    let maxEquity = config.initCapital;
+    
+    // Weights
+    const base_sum = config.w_ceo_l + config.w_ceo_s + config.w_kama;
+    let curr_w1 = config.w_kama;
+    let curr_w2 = config.w_ceo_l;
+    let curr_w3 = config.w_ceo_s;
+    let curr_bench_contracts = config.w_bench;
+
+    let lastWeekNum = -1;
+    let prevBenchPrice = benchKey ? (parseFloat(simData[0][benchKey]) || 0) : 0;
+
+    // Arrays for plotting
+    const portEquityCurve = [];
+    const benchEquityCurve = [];
+    const portHighWatermark = [];
+    const leverageCurve = [];
+    const safeLevelCurve = [];
+    
+    // Stats accumulators
+    const dailyPnLMap = {};
+    const dateKeyOrder = [];
+    const quarterlyStats = {};
+
+    // 3. Loop
+    simData.forEach((row, i) => {
+        const dateObj = new Date(row.ts);
+        const currentPrice = benchKey ? (parseFloat(row[benchKey]) || 0) : 0;
+
+        // --- Weekly Rebalance Logic ---
+        if (config.useFixedLev && !isNaN(dateObj.getTime())) {
+            const currentWeekNum = getWeekNumber(dateObj);
+            if (currentWeekNum !== lastWeekNum || i === 0) {
+                lastWeekNum = currentWeekNum;
+                if (currentPrice > 0) {
+                    // Portfolio
+                    if (base_sum > 0) {
+                        const targetExposure = currPortEquity * config.targetLev;
+                        const contractVal = currentPrice * config.multiplier;
+                        let k = Math.round((targetExposure / contractVal) / base_sum);
+                        if (k < 1) k = 1; // Min restriction
+                        curr_w1 = config.w_kama * k;
+                        curr_w2 = config.w_ceo_l * k;
+                        curr_w3 = config.w_ceo_s * k;
+                    }
+                    // Benchmark (using Portfolio Equity as base for fairness)
+                    const benchTargetExposure = currPortEquity * config.targetLev;
+                    const benchContractVal = currentPrice * config.multiplier;
+                    let targetBenchContracts = Math.round(benchTargetExposure / benchContractVal);
+                    if (targetBenchContracts < 1) targetBenchContracts = 1;
+                    curr_bench_contracts = targetBenchContracts;
+                }
+            }
+        } else if (!config.useFixedLev) {
+            curr_bench_contracts = config.w_bench;
+            curr_w1 = config.w_kama;
+            curr_w2 = config.w_ceo_l;
+            curr_w3 = config.w_ceo_s;
+        }
+
+        // --- PnL Calculation ---
+        const p1 = (parseFloat(row.kama_L) || 0) * curr_w1;
+        const p2 = (parseFloat(row.ceo_L) || 0) * curr_w2;
+        const p3 = (parseFloat(row.ceo_S) || 0) * curr_w3;
+        const pointPnL = p1 + p2 + p3;
+        const moneyPnL = pointPnL * config.multiplier;
+
+        let benchMoneyPnL = 0;
+        if (i > 0) {
+            const priceDelta = currentPrice - prevBenchPrice;
+            benchMoneyPnL = priceDelta * curr_bench_contracts * config.multiplier;
+        }
+        prevBenchPrice = currentPrice;
+
+        currPortEquity += moneyPnL;
+        currBenchEquity += benchMoneyPnL;
+        if (currPortEquity > maxEquity) maxEquity = currPortEquity;
+
+        // --- Record Data ---
+        portEquityCurve.push(currPortEquity);
+        benchEquityCurve.push(currBenchEquity);
+        portHighWatermark.push(maxEquity);
+
+        // Leverage
+        const totalContractsHeld = Math.abs(curr_w1) + Math.abs(curr_w2) + Math.abs(curr_w3);
+        const exposure = currentPrice * totalContractsHeld * config.multiplier;
+        const lev = (currPortEquity > 0) ? (exposure / currPortEquity) : 0;
+        leverageCurve.push(lev);
+
+        // Safe Level
+        const totalLongs = Math.abs(curr_w1) + Math.abs(curr_w2);
+        const totalShorts = Math.abs(curr_w3);
+        const maxSideContracts = Math.max(totalLongs, totalShorts);
+        const contractValue = currentPrice * config.multiplier;
+        const safeLevelVal = (maxSideContracts * contractValue) / config.safeFactor;
+        safeLevelCurve.push(safeLevelVal);
+
+        // Daily PnL for Sharpe
+        const dateStr = row.ts.split(' ')[0];
+        if (!dailyPnLMap[dateStr]) {
+            dailyPnLMap[dateStr] = 0;
+            dateKeyOrder.push(dateStr);
+        }
+        dailyPnLMap[dateStr] += moneyPnL;
+
+        // Quarterly
+        if (!isNaN(dateObj)) {
+            const y = dateObj.getFullYear();
+            const q = Math.floor(dateObj.getMonth() / 3) + 1;
+            const key = `${y}-Q${q}`;
+            if (!quarterlyStats[key]) quarterlyStats[key] = { port: 0, bench: 0 };
+            quarterlyStats[key].port += moneyPnL;
+            quarterlyStats[key].bench += benchMoneyPnL;
+        }
+    });
+
+    // 4. Calculate Statistics
+    // Drawdowns
+    let peak = portEquityCurve[0];
+    let peakIdx = 0;
+    let ddPeriods = [];
+    let currentDD = null;
+
+    portEquityCurve.forEach((val, i) => {
+        if (val >= peak) {
+            if (currentDD) {
+                currentDD.endIdx = i;
+                ddPeriods.push(currentDD);
+                currentDD = null;
+            }
+            peak = val;
+            peakIdx = i;
+        } else {
+            const ddAmount = val - peak;
+            if (!currentDD) {
+                currentDD = { startIdx: peakIdx, valleyIdx: i, maxLoss: ddAmount, endIdx: -1 };
+            } else {
+                if (ddAmount < currentDD.maxLoss) {
+                    currentDD.maxLoss = ddAmount;
+                    currentDD.valleyIdx = i;
+                }
+            }
+        }
+    });
+    if (currentDD) ddPeriods.push(currentDD);
+    ddPeriods.sort((a, b) => a.maxLoss - b.maxLoss); // Sort by max loss (ascending because negative)
+    const mddMoney = ddPeriods.length > 0 ? ddPeriods[0].maxLoss : 0;
+
+    // Sharpe / Sortino
+    let dailyReturns = [];
+    let tempEquity = config.initCapital;
+    dateKeyOrder.forEach(date => {
+        const dPnL = dailyPnLMap[date];
+        const ret = (tempEquity > 0) ? (dPnL / tempEquity) : 0;
+        dailyReturns.push(ret);
+        tempEquity += dPnL;
+    });
+
+    const sumRet = dailyReturns.reduce((a,b) => a+b, 0);
+    const meanRet = sumRet / dailyReturns.length;
+    const sumSqDiff = dailyReturns.reduce((a,b) => a + Math.pow(b - meanRet, 2), 0);
+    const stdRet = Math.sqrt(sumSqDiff / dailyReturns.length);
+    const sharpe = (stdRet > 0) ? (meanRet / stdRet) * Math.sqrt(252) : 0;
+
+    const sumSqDown = dailyReturns.reduce((a, b) => a + (b < 0 ? Math.pow(b, 2) : 0), 0);
+    const downDev = Math.sqrt(sumSqDown / dailyReturns.length);
+    const sortino = (downDev > 0) ? (meanRet / downDev) * Math.sqrt(252) : 0;
+
+    const totalProfit = currPortEquity - config.initCapital;
+
+    return {
+        times,
+        portEquityCurve,
+        benchEquityCurve,
+        portHighWatermark,
+        leverageCurve,
+        safeLevelCurve,
+        quarterlyStats,
+        ddPeriods: ddPeriods.slice(0, 10),
+        stats: {
+            finalEquity: currPortEquity,
+            totalProfit,
+            mddMoney,
+            sharpe,
+            sortino,
+            finalBenchEquity: currBenchEquity
+        },
+        benchKey
+    };
+  }, [rawData, config]);
+
+  // --- Monitor Calculations (Simple) ---
+  const monitorResults = useMemo(() => {
+    if (rawData.length === 0) return null;
+    
+    // Filter logic similar to simulation
+    let monData = [...rawData];
+    if (config.timeRange !== 'ALL') {
+       const lastDate = new Date(rawData[rawData.length - 1].ts);
+       let startDate = new Date(lastDate);
+       switch(config.timeRange) {
+         case 'YTD': startDate = new Date(lastDate.getFullYear(), 0, 1); break;
+         case '6M': startDate.setMonth(startDate.getMonth() - 6); break;
+         case '1Y': startDate.setFullYear(startDate.getFullYear() - 1); break;
+         case '2Y': startDate.setFullYear(startDate.getFullYear() - 2); break;
+         case '3Y': startDate.setFullYear(startDate.getFullYear() - 3); break;
+         default: break;
+       }
+       monData = rawData.filter(d => new Date(d.ts) >= startDate);
+    }
+    if (monData.length === 0) return null;
+
+    const times = monData.map(d => d.ts);
+    const strategies = ['kama_L', 'ceo_L', 'ceo_S'];
+    const results = {};
+
+    strategies.forEach(strat => {
+        if (!monData[0].hasOwnProperty(strat)) return;
+        const pnl = monData.map(d => parseFloat(d[strat]) || 0);
+        const cum = [];
+        pnl.reduce((a, b, i) => cum[i] = a + b, 0);
+        
+        // Drawdown
+        let maxP = -Infinity;
+        const dd = cum.map(v => {
+            if (v > maxP) maxP = v;
+            return v - maxP;
+        });
+        const mdd = Math.min(...dd);
+        results[strat] = { cum, dd, total: cum[cum.length-1], mdd };
+    });
+
+    return { times, results };
+  }, [rawData, config.timeRange]);
+
+  // --- AI Functions ---
+  const callGemini = async (prompt) => {
+    if (!apiKey) {
+      alert("請先輸入 API Key");
+      return null;
+    }
+    setAiLoading(true);
+    try {
+      const genAI = new GoogleGenerativeAI(apiKey);
+      const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-preview-09-2025" });
+      const result = await model.generateContent(prompt);
+      const response = await result.response;
+      return response.text();
+    } catch (e) {
+      console.error(e);
+      return `AI 錯誤: ${e.message}`;
+    } finally {
+      setAiLoading(false);
+    }
+  };
+
+  const getContextData = () => {
+    if (!simulationResults) return "無數據";
+    const lastData = rawData[rawData.length - 1] || {};
+    return `
+    當前策略回測數據 (區間: ${config.timeRange}):
+    - 總淨值 (Net Equity): ${Math.round(simulationResults.stats.finalEquity).toLocaleString()}
+    - 總損益: ${Math.round(simulationResults.stats.totalProfit).toLocaleString()}
+    - 最大回撤 (MDD): ${Math.round(simulationResults.stats.mddMoney).toLocaleString()}
+    - 夏普比率: ${simulationResults.stats.sharpe.toFixed(2)}
+    - Sortino: ${simulationResults.stats.sortino.toFixed(2)}
+    - 最新 TXF: ${lastData.TXF_abs || 'N/A'}
+    - 當前設定: 初始 ${config.initCapital}, 槓桿 ${config.targetLev}x (固定: ${config.useFixedLev})
+    `;
+  };
+
+  const handleSendMessage = async () => {
+    if (!chatInput.trim()) return;
+    const userMsg = chatInput;
+    setChatHistory(prev => [...prev, { role: 'user', text: userMsg }]);
+    setChatInput("");
+
+    const context = getContextData();
+    const prompt = `Role: 專業量化交易員. Context: ${context}. User Question: ${userMsg}. 請用繁體中文簡潔回答。`;
+    
+    const reply = await callGemini(prompt);
+    setChatHistory(prev => [...prev, { role: 'ai', text: reply }]);
+  };
+
+  const generateReport = async () => {
+    setChatHistory(prev => [...prev, { role: 'ai', text: '正在撰寫報告...' }]);
+    const context = getContextData();
+    const prompt = `Role: 避險基金經理. Task: 根據數據寫一份繁體中文策略健檢報告. Data: ${context}. Requirements: 點評獲利與風險, 給出槓桿建議, 使用 Markdown.`;
+    const reply = await callGemini(prompt);
+    setChatHistory(prev => [...prev, { role: 'ai', text: reply }]);
+  };
+
+  // --- Styles ---
+  const appStyles = `
+    .container { max-width: 1200px; margin: 0 auto; padding: 20px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color: ${COLORS.text}; background: ${COLORS.bg}; min-height: 100vh; }
+    header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px; padding-bottom: 15px; border-bottom: 1px solid ${COLORS.border}; flex-wrap: wrap; gap: 15px; }
+    header h2 { font-size: 1.5rem; margin: 0; font-weight: 700; color: ${COLORS.benchmark}; letter-spacing: 0.5px; }
+    .status-badge { background-color: #C6F6D5; color: #22543D; padding: 5px 10px; border-radius: 20px; font-size: 0.85em; font-weight: 600; display: inline-flex; align-items: center; gap: 5px; cursor: default; user-select: none; }
+    .tabs { display: flex; gap: 10px; margin-bottom: 25px; border-bottom: 1px solid ${COLORS.border}; overflow-x: auto; }
+    .tab-btn { padding: 12px 20px; background: transparent; border: none; color: ${COLORS.subText}; font-size: 1rem; cursor: pointer; border-bottom: 3px solid transparent; transition: all 0.3s; font-weight: 500; flex-shrink: 0; }
+    .tab-btn:hover { color: ${COLORS.portfolio}; }
+    .tab-btn.active { color: ${COLORS.portfolio}; border-bottom-color: ${COLORS.portfolio}; font-weight: 700; }
+    .tab-content { animation: fadeIn 0.4s ease; }
+    
+    .control-panel { background-color: ${COLORS.card}; padding: 25px; border-radius: 16px; margin-bottom: 25px; box-shadow: 0 4px 12px rgba(0,0,0,0.03); border: 1px solid ${COLORS.border}; }
+    .control-row { display: flex; gap: 20px; flex-wrap: wrap; align-items: center; margin-bottom: 20px; }
+    .control-row:last-child { margin-bottom: 0; }
+    .section-title { font-size: 0.95em; color: ${COLORS.portfolio}; font-weight: 700; width: 100%; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
+    .input-group { display: flex; flex-direction: column; gap: 6px; flex: 1; min-width: 100px; }
+    .input-group label { font-size: 0.85em; color: ${COLORS.subText}; font-weight: 500; }
+    .input-group input, .input-group select { background: ${COLORS.inputBg}; border: 1px solid ${COLORS.border}; color: ${COLORS.text}; padding: 10px 12px; border-radius: 8px; width: 100%; text-align: center; font-size: 1em; font-weight: 600; box-sizing: border-box; }
+    .input-group.checkbox-group { flex-direction: row; align-items: center; gap: 12px; flex: 1 0 100%; background: #FFFAF0; padding: 12px 15px; border-radius: 8px; border: 1px solid #FEEBC8; }
+    .input-group.checkbox-group input { width: 20px; height: 20px; cursor: pointer; }
+    .input-group.checkbox-group label { font-size: 1em; color: #744210; margin: 0; cursor: pointer; }
+
+    .grid-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 15px; margin-bottom: 25px; }
+    .card { background-color: ${COLORS.card}; padding: 20px; border-radius: 16px; text-align: center; box-shadow: 0 4px 12px rgba(0,0,0,0.03); border: 1px solid ${COLORS.border}; transition: transform 0.2s; }
+    .card:hover { transform: translateY(-2px); }
+    .card h3 { margin: 0 0 8px 0; font-size: 0.9em; color: ${COLORS.subText}; font-weight: 500; }
+    .card .value { font-size: 1.5em; font-weight: 700; margin: 5px 0; color: ${COLORS.text}; }
+    .card .sub { font-size: 0.8em; color: ${COLORS.subText}; margin-top: 4px; }
+    .value.negative { color: ${COLORS.negative}; }
+
+    .chart-box, .info-card { background-color: ${COLORS.card}; padding: 20px; border-radius: 16px; margin-bottom: 25px; box-shadow: 0 4px 12px rgba(0,0,0,0.03); border: 1px solid ${COLORS.border}; overflow: hidden; }
+    .chart-header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; flex-wrap: wrap; gap: 10px; }
+    .time-filters { display: flex; gap: 5px; background: #EDF2F7; padding: 4px; border-radius: 8px; overflow-x: auto; }
+    .tf-btn { background: transparent; border: none; color: #718096; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 0.85em; font-weight: 600; white-space: nowrap; transition: all 0.2s; }
+    .tf-btn:hover { background-color: rgba(255,255,255,0.5); }
+    .tf-btn.active { background: #FFFFFF; color: ${COLORS.portfolio}; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+
+    .table-container { background-color: ${COLORS.card}; padding: 20px; border-radius: 16px; margin-bottom: 25px; box-shadow: 0 4px 12px rgba(0,0,0,0.03); border: 1px solid ${COLORS.border}; overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.95em; min-width: 600px; }
+    th { text-align: left; padding: 15px; border-bottom: 2px solid #EDF2F7; color: ${COLORS.subText}; font-weight: 600; white-space: nowrap; }
+    td { padding: 15px; border-bottom: 1px solid #EDF2F7; color: ${COLORS.text}; white-space: nowrap; }
+    .td-num { text-align: right; font-family: monospace; font-weight: 500; }
+    .rank-badge { background: ${COLORS.inputBg}; color: ${COLORS.subText}; padding: 4px 10px; border-radius: 12px; font-size: 0.85em; font-weight: 700; border: 1px solid ${COLORS.border}; }
+
+    .ai-setup-box { background: linear-gradient(135deg, #fff, #f8fafc); border: 1px solid ${COLORS.border}; padding: 20px; border-radius: 12px; margin-bottom: 20px; }
+    .ai-btn { background: linear-gradient(135deg, ${COLORS.portfolio}, #c05621); color: white; border: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+    .chat-container { display: flex; flex-direction: column; gap: 15px; max-height: 500px; overflow-y: auto; margin-bottom: 20px; padding: 10px; border: 1px solid ${COLORS.border}; border-radius: 12px; background: #FAFAFA; }
+    .chat-bubble { padding: 12px 16px; border-radius: 12px; max-width: 85%; line-height: 1.6; font-size: 0.95em; }
+    .chat-bubble.user { align-self: flex-end; background-color: #FEFCBF; color: #744210; }
+    .chat-bubble.ai { align-self: flex-start; background-color: #F0F4F8; color: ${COLORS.text}; }
+    
+    .info-card-header { display: flex; align-items: center; gap: 15px; border-bottom: 1px solid ${COLORS.border}; padding-bottom: 15px; margin-bottom: 20px; }
+    .strat-icon { width: 50px; height: 50px; border-radius: 12px; display: flex; align-items: center; justify-content: center; color: white; }
+    .info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 30px; }
+    .info-section h4 { color: ${COLORS.portfolio}; margin: 0 0 12px 0; border-left: 4px solid ${COLORS.portfolio}; padding-left: 10px; }
+    .info-list { list-style: none; padding: 0; }
+    .info-list li { position: relative; padding-left: 20px; margin-bottom: 10px; }
+    .info-list li::before { content: '•'; color: ${COLORS.subText}; position: absolute; left: 0; }
+    .logic-box { background: ${COLORS.inputBg}; padding: 15px; border-radius: 8px; font-family: monospace; font-size: 0.9em; border: 1px solid ${COLORS.border}; }
+
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+  `;
+
+  // --- Render ---
+  return (
+    <>
+      <style>{appStyles}</style>
+      <div className="container">
+        {/* Header */}
+        <header>
+          <div>
+            <h2>📊 台指期趨勢追蹤 Web App</h2>
+            <div style={{fontSize: '0.85em', color: COLORS.subText, marginTop: '5px'}}>
+              React SPA • Gemini AI Inside
+            </div>
+          </div>
+          <div style={{display:'flex', gap:'10px', alignItems:'center', flexWrap:'wrap'}}>
+              <label className="status-badge" style={{cursor:'pointer', background: COLORS.inputBg, border: `1px solid ${COLORS.border}`, color: COLORS.text}}>
+                  <Upload size={14}/> 
+                  <span style={{marginLeft:5}}>上傳 CSV</span>
+                  <input type="file" accept=".csv" style={{display:'none'}} onChange={(e) => {
+                      if(e.target.files[0]) loadData(e.target.files[0], 'upload');
+                  }}/>
+              </label>
+              
+              {REMOTE_CSV_URL && (
+                  <label className="status-badge" style={{cursor:'pointer', background: COLORS.inputBg, border: `1px solid ${COLORS.border}`, color: COLORS.text}} onClick={() => loadData(REMOTE_CSV_URL, 'remote')}>
+                      <RefreshCw size={14}/>
+                      <span style={{marginLeft:5}}>更新資料</span>
+                  </label>
+              )}
+
+              <span className="status-badge" style={{
+                  backgroundColor: loading ? '#FEFCBF' : '#C6F6D5', 
+                  color: loading ? '#975A16' : '#22543D'
+              }}>
+                  {loading ? 'Loading...' : `Data: ${rawData.length} rows`}
+              </span>
+          </div>
+        </header>
+
+        {error && (
+          <div style={{background:'#FED7D7', color:'#C53030', padding:'15px', borderRadius:'8px', marginBottom:'20px', border:'1px solid #FEB2B2'}}>
+              <strong>⚠️ Error:</strong> {error}
+          </div>
+        )}
+
+        {/* Tabs */}
+        <div className="tabs">
+          {[
+              {id:'sim', label:'🛠️ 投資組合模擬'},
+              {id:'monitor', label:'📈 策略監控'},
+              {id:'ai', label:'✨ AI 智能分析'},
+              {id:'intro', label:'📘 策略介紹'}
+          ].map(t => (
+              <button key={t.id} 
+                  className={`tab-btn ${activeTab === t.id ? 'active' : ''}`}
+                  onClick={() => setActiveTab(t.id)}
+              >
+                  {t.label}
+              </button>
+          ))}
+        </div>
+
+        {/* Content */}
+        <div className="tab-content active">
+          {activeTab === 'sim' && simulationResults && (
+              <>
+                  <div className="control-panel">
+                      <div className="control-row">
+                          <div className="section-title">帳戶設定</div>
+                          <div className="input-group">
+                              <label>初始資金</label>
+                              <input type="number" value={config.initCapital} step={10000} 
+                                  onChange={(e) => setConfig({...config, initCapital: parseFloat(e.target.value)})} />
+                          </div>
+                          <div className="input-group">
+                              <label>交易商品</label>
+                              <select value={config.multiplier} onChange={(e) => setConfig({...config, multiplier: parseFloat(e.target.value)})}>
+                                  <option value={50}>小台 (MTX)</option>
+                                  <option value={200}>大台 (TX)</option>
+                              </select>
+                          </div>
+                          <div className="input-group checkbox-group">
+                              <input type="checkbox" id="cbox_lev" checked={config.useFixedLev} 
+                                  onChange={(e) => setConfig({...config, useFixedLev: e.target.checked})} />
+                              <label htmlFor="cbox_lev">固定槓桿</label>
+                          </div>
+                          <div className="input-group">
+                              <label>目標倍數</label>
+                              <input type="number" value={config.targetLev} step={0.5} 
+                                  onChange={(e) => setConfig({...config, targetLev: parseFloat(e.target.value)})} />
+                          </div>
+                          <div className="input-group">
+                              <label>安全係數 (1/x)</label>
+                              <input type="number" value={config.safeFactor} step={0.5} 
+                                  onChange={(e) => setConfig({...config, safeFactor: parseFloat(e.target.value)})} />
+                          </div>
+                      </div>
+                      
+                      <div className="control-row">
+                          <div className="section-title">權重配置</div>
+                          <div className="input-group"><label>ceo_L</label><input type="number" value={config.w_ceo_l} onChange={e=>setConfig({...config, w_ceo_l:parseFloat(e.target.value)})}/></div>
+                          <div className="input-group"><label>ceo_S</label><input type="number" value={config.w_ceo_s} onChange={e=>setConfig({...config, w_ceo_s:parseFloat(e.target.value)})}/></div>
+                          <div className="input-group"><label>kama_L</label><input type="number" value={config.w_kama} onChange={e=>setConfig({...config, w_kama:parseFloat(e.target.value)})}/></div>
+                          <div className="input-group"><label>Benchmark</label><input type="number" value={config.w_bench} onChange={e=>setConfig({...config, w_bench:parseFloat(e.target.value)})}/></div>
+                      </div>
+                  </div>
+
+                  <div className="grid-stats">
+                      <StatsCard title="期末淨值" value={`$${Math.round(simulationResults.stats.finalEquity/10000)}萬`} sub={`+$${Math.round(simulationResults.stats.totalProfit).toLocaleString()}`} color={COLORS.portfolio} />
+                      <StatsCard title="最大回撤 (MDD)" value={`$${Math.round(simulationResults.stats.mddMoney/10000)}萬`} sub="Risk" color={COLORS.negative} isNegative />
+                      <StatsCard title="風險指標" value={simulationResults.stats.sharpe.toFixed(2)} sub={`Sortino: ${simulationResults.stats.sortino.toFixed(2)}`} color="#9C27B0" />
+                      <StatsCard title="Benchmark" value={`$${Math.round(simulationResults.stats.finalBenchEquity/10000)}萬`} sub={config.useFixedLev ? `Lev ${config.targetLev}x` : `${config.w_bench}口`} color={COLORS.benchmark} />
+                  </div>
+
+                  <div className="chart-box">
+                      <div className="chart-header-row">
+                          <h3 style={{margin:0, color: COLORS.text}}>帳戶權益曲線 (含安全水位)</h3>
+                          <div className="time-filters">
+                              {['6M','YTD','1Y','2Y','3Y','ALL'].map(p => (
+                                  <button key={p} className={`tf-btn ${config.timeRange===p?'active':''}`} onClick={()=>setConfig({...config, timeRange:p})}>{p}</button>
+                              ))}
+                          </div>
+                      </div>
+                      <EquityChart data={simulationResults} height={450} config={config} />
+                  </div>
+
+                  <div className="chart-box">
+                      <h3 style={{margin:0, marginBottom:10, color: COLORS.text}}>⚖️ 槓桿比例變化</h3>
+                      <LeverageChart data={simulationResults} height={250} config={config} />
+                  </div>
+
+                  <div className="table-container">
+                      <h3 style={{marginTop:0, marginBottom:15, color: COLORS.text}}>📉 前 10 大回檔 (Top 10 Drawdowns)</h3>
+                      <DrawdownTable data={simulationResults.ddPeriods} />
+                  </div>
+
+                  <div className="chart-box">
+                      <h3 style={{margin:0, marginBottom:15, color: COLORS.text}}>📅 季度績效分析</h3>
+                      <QuarterlyChart data={simulationResults.quarterlyStats} />
+                  </div>
+              </>
+          )}
+
+          {activeTab === 'monitor' && monitorResults && (
+              <>
+                  <div className="chart-box" style={{marginBottom:15, padding:10}}>
+                      <div className="chart-header-row" style={{marginBottom:0}}>
+                          <h3 style={{margin:0, color:COLORS.text}}>時間區間篩選</h3>
+                          <div className="time-filters">
+                              {['6M','YTD','1Y','2Y','3Y','ALL'].map(p => (
+                                  <button key={p} className={`tf-btn ${config.timeRange===p?'active':''}`} onClick={()=>setConfig({...config, timeRange:p})}>{p}</button>
+                              ))}
+                          </div>
+                      </div>
+                  </div>
+                  <div className="grid-stats">
+                      {Object.keys(monitorResults.results).map((strat, i) => {
+                          const s = monitorResults.results[strat];
+                          const colors = ['#3182CE', '#D69E2E', '#38A169'];
+                          return <StatsCard key={strat} title={strat} value={Math.round(s.total).toLocaleString()} sub={`MDD: ${Math.round(s.mdd)}`} color={colors[i%3]} />;
+                      })}
+                  </div>
+                  <div className="chart-box">
+                      <h3 style={{marginBottom:10, color:COLORS.text}}>個別策略累積損益</h3>
+                      <MonitorEquityChart data={monitorResults} />
+                  </div>
+                  <div className="chart-box">
+                      <h3 style={{marginBottom:10, color:COLORS.text}}>策略回撤 (Drawdown)</h3>
+                      <MonitorDDChart data={monitorResults} />
+                  </div>
+              </>
+          )}
+
+          {activeTab === 'ai' && (
+              <>
+                  <div className="ai-setup-box">
+                      <h3 style={{margin:0, marginBottom:10, color: COLORS.benchmark}}>🔑 Gemini API 設定</h3>
+                      <div style={{display:'flex', gap:10}}>
+                          <input type="password" value={apiKey} onChange={e=>setApiKey(e.target.value)} placeholder="API Key" style={{flex:1, padding:10, borderRadius:8, border:`1px solid ${COLORS.border}`}} />
+                          <button className="ai-btn" onClick={()=>{localStorage.setItem('gemini_api_key', apiKey); alert('Saved!');}}>儲存</button>
+                      </div>
+                  </div>
+                  <div className="grid-stats">
+                      <div className="card" onClick={generateReport} style={{cursor:'pointer', border:`1px solid ${COLORS.portfolio}`}}>
+                          <h3 style={{color:COLORS.portfolio}}>✨ 產生策略健檢報告</h3>
+                          <div className="sub">點擊分析當前績效</div>
+                      </div>
+                  </div>
+                  <div className="chart-box">
+                      <div className="chat-container">
+                          {chatHistory.map((msg, i) => (
+                              <div key={i} className={`chat-bubble ${msg.role === 'user' ? 'user' : 'ai'}`}>
+                                  {msg.role === 'ai' ? <div dangerouslySetInnerHTML={{__html: marked.parse(msg.text)}} /> : msg.text}
+                              </div>
+                          ))}
+                          {aiLoading && <div className="chat-bubble ai">思考中...</div>}
+                      </div>
+                      <div style={{display:'flex', gap:10}}>
+                          <input type="text" value={chatInput} onChange={e=>setChatInput(e.target.value)} onKeyPress={e=>e.key==='Enter'&&handleSendMessage()} placeholder="輸入問題..." style={{flex:1, padding:10, borderRadius:8, border:`1px solid ${COLORS.border}`}} />
+                          <button className="ai-btn" onClick={handleSendMessage} disabled={aiLoading}>發送</button>
+                      </div>
+                  </div>
+              </>
+          )}
+
+          {activeTab === 'intro' && (
+              <div className="intro-container">
+                 <InfoCard 
+                   title="KAMA Cloud 趨勢雲策略" 
+                   icon={<Activity color="white"/>}
+                   bg="linear-gradient(135deg, #F5C518, #D69E2E)"
+                   concept="利用 20 條 KAMA 均線構成網狀結構，捕捉趨勢發散。"
+                   logic="進場: 多頭排列 + 雲帶金叉 + 動能轉強"
+                 />
+                 <div style={{height:20}}/>
+                 <InfoCard 
+                   title="Chandelier Exit 吊燈策略" 
+                   icon={<ShieldCheck color="white"/>}
+                   bg="linear-gradient(135deg, #58A6FF, #2D3748)"
+                   concept="ATR 移動止損，像吊燈一樣掛在最高點。"
+                   logic="多單: 價格 > 底部 + ATR*N"
+                 />
+              </div>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+// --- Sub Components ---
+
+const StatsCard = ({ title, value, sub, color, isNegative }) => (
+  <div className="card" style={{borderTop: `4px solid ${color}`}}>
+    <h3>{title}</h3>
+    <div className={`value ${isNegative ? 'negative' : ''}`} style={{color: isNegative ? COLORS.negative : COLORS.text}}>{value}</div>
+    <div className="sub">{sub}</div>
+  </div>
+);
+
+const InfoCard = ({title, icon, bg, concept, logic}) => (
+    <div className="info-card">
+        <div className="info-card-header">
+            <div className="strat-icon" style={{background: bg}}>{icon}</div>
+            <div className="strat-title"><h3>{title}</h3></div>
+        </div>
+        <div className="info-grid">
+            <div className="info-section">
+                <h4>💡 核心概念</h4>
+                <ul className="info-list"><li>{concept}</li></ul>
+            </div>
+            <div className="info-section">
+                <h4>⚙️ 邏輯</h4>
+                <div className="logic-box">{logic}</div>
+            </div>
+        </div>
+    </div>
+);
+
+const EquityChart = ({ data, height, config }) => {
+    // Determine Y2
+    const hasY2 = config.useFixedLev && data.benchKey;
+    
+    return (
+        <Plot
+            data={[
+                { x: data.times, y: data.portEquityCurve, name: 'Portfolio', type: 'scatter', mode: 'lines', line: { color: COLORS.portfolio, width: 2 }, fill: 'tozeroy', fillcolor: 'rgba(214, 158, 46, 0.1)' },
+                { x: data.times, y: data.benchEquityCurve, name: 'Benchmark', type: 'scatter', mode: 'lines', line: { color: COLORS.benchmark, width: 1.5 } },
+                { x: data.times, y: data.portHighWatermark, name: 'High', type: 'scatter', mode: 'lines', line: { color: COLORS.positive, width: 1, dash: 'dot' }, opacity: 0.6 },
+                { x: data.times, y: data.safeLevelCurve, name: 'Safe Level', type: 'scatter', mode: 'lines', line: { color: COLORS.safeLine, width: 1.5, dash: 'dash' }, opacity: 0.8 },
+                ...(hasY2 ? [{ x: data.times, y: data.times.map((t,i) => parseFloat(data[i]?.[data.benchKey] || 0)), name: 'Index', yaxis: 'y2', type: 'scatter', mode: 'lines', line: { color: '#CBD5E0', width: 1 }, opacity: 0.5 }] : [])
+            ]}
+            layout={{
+                autosize: true, height: height,
+                margin: { t: 30, l: 40, r: hasY2 ? 50 : 40, b: 30 },
+                paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+                font: { color: COLORS.subText },
+                xaxis: { gridcolor: COLORS.border },
+                yaxis: { title: '金額 (NTD)', gridcolor: COLORS.border },
+                yaxis2: hasY2 ? { title: 'Index', overlaying: 'y', side: 'right', showgrid: false } : undefined,
+                legend: { orientation: 'h', y: 1.1, x: 0 },
+                hovermode: 'x unified'
+            }}
+            useResizeHandler={true}
+            style={{width: "100%"}}
+        />
+    );
+};
+
+const LeverageChart = ({ data, height, config }) => (
+    <Plot
+        data={[
+            { x: data.times, y: data.leverageCurve, name: 'Leverage', type: 'scatter', mode: 'lines', fill: 'tozeroy', line: { color: '#9C27B0', width: 1.5 }, fillcolor: 'rgba(156, 39, 176, 0.1)' },
+            ...(config.useFixedLev ? [{ x: [data.times[0], data.times[data.times.length-1]], y: [config.targetLev, config.targetLev], name: 'Target', mode: 'lines', line: { color: '#9C27B0', width: 1, dash: 'dash' } }] : [])
+        ]}
+        layout={{
+            autosize: true, height: height,
+            margin: { t: 30, l: 40, r: 20, b: 30 },
+            paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+            font: { color: COLORS.subText },
+            xaxis: { gridcolor: COLORS.border }, yaxis: { title: '倍數 (x)', gridcolor: COLORS.border },
+            hovermode: 'x unified', showlegend: false
+        }}
+        useResizeHandler={true} style={{width: "100%"}}
+    />
+);
+
+const QuarterlyChart = ({ data }) => {
+    const keys = Object.keys(data).sort();
+    return (
+        <Plot
+            data={[
+                { x: keys, y: keys.map(k => data[k].port), name: 'Port', type: 'bar', marker: { color: COLORS.portfolio } },
+                { x: keys, y: keys.map(k => data[k].bench), name: 'Bench', type: 'bar', marker: { color: COLORS.benchmark, opacity: 0.5 } }
+            ]}
+            layout={{
+                autosize: true, height: 350,
+                margin: { t: 30, l: 40, r: 20, b: 60 },
+                paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+                font: { color: COLORS.subText },
+                xaxis: { gridcolor: COLORS.border, tickangle: -45 }, yaxis: { gridcolor: COLORS.border, title: '損益' },
+                barmode: 'group', legend: { orientation: 'h', y: 1.1 }
+            }}
+            useResizeHandler={true} style={{width: "100%"}}
+        />
+    );
+};
+
+const DrawdownTable = ({ data }) => (
+    <table>
+        <thead><tr><th>#</th><th>Peak</th><th>Valley</th><th>End</th><th className="td-num">Max Loss</th></tr></thead>
+        <tbody>
+            {data.map((d, i) => (
+                <tr key={i}>
+                    <td><span className="rank-badge" style={{
+                        background: i===0?'#FED7D7':i===1?'#FEEBC8':i===2?'#FEFCBF':COLORS.inputBg,
+                        color: i===0?'#C53030':i===1?'#C05621':i===2?'#975A16':COLORS.subText
+                    }}>{i+1}</span></td>
+                    <td>{d.start ? d.start.split(' ')[0] : '-'}</td>
+                    <td>{d.valley ? d.valley.split(' ')[0] : '-'}</td>
+                    <td>{d.end && d.end !== 'Open' ? d.end.split(' ')[0] : 'Open'}</td>
+                    <td className="td-num negative" style={{color:COLORS.negative}}>
+                        {Math.round(d.maxLoss).toLocaleString()}
+                    </td>
+                </tr>
+            ))}
+        </tbody>
+    </table>
+);
+
+const MonitorEquityChart = ({ data }) => {
+    const colors = ['#3182CE', '#D69E2E', '#38A169'];
+    return (
+        <Plot
+            data={Object.keys(data.results).map((strat, i) => ({
+                x: data.times, y: data.results[strat].cum, name: strat, type: 'scatter', mode: 'lines', line: { color: colors[i%3], width: 2 }
+            }))}
+            layout={{
+                autosize: true, height: 400, margin: { t: 30, l: 40, r: 20, b: 30 },
+                paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)', font: { color: COLORS.subText },
+                xaxis: { gridcolor: COLORS.border }, yaxis: { gridcolor: COLORS.border }, hovermode: 'x unified', legend: { orientation: 'h', y: 1.1 }
+            }}
+            useResizeHandler={true} style={{width: "100%"}}
+        />
+    );
+};
+
+const MonitorDDChart = ({ data }) => {
+    const colors = ['#3182CE', '#D69E2E', '#38A169'];
+    return (
+        <Plot
+            data={Object.keys(data.results).map((strat, i) => ({
+                x: data.times, y: data.results[strat].dd, name: strat, type: 'scatter', mode: 'lines', fill: 'tozeroy', line: { color: colors[i%3], width: 1 }
+            }))}
+            layout={{
+                autosize: true, height: 300, margin: { t: 30, l: 40, r: 20, b: 30 },
+                paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)', font: { color: COLORS.subText },
+                xaxis: { gridcolor: COLORS.border }, yaxis: { gridcolor: COLORS.border }, hovermode: 'x unified', showlegend: false
+            }}
+            useResizeHandler={true} style={{width: "100%"}}
+        />
+    );
+};
