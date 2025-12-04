@@ -1,0 +1,984 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>台指期趨勢追蹤策略</title>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        :root {
+            /* 奶油色質感主題 (Creamy/Luxury Theme) */
+            --bg-color: #F7F5F2;       /* 柔和奶油灰白底 */
+            --card-bg: #FFFFFF;        /* 純白卡片 */
+            --text-color: #4A4A4A;     /* 深暖灰文字 */
+            --text-sub: #8C8C8C;       /* 次要文字 */
+            --accent-color: #D69E2E;   /* 質感金橘 (Portfolio) */
+            --benchmark-color: #2D3748;/* 深靛藍 (Benchmark) */
+            --safe-line-color: #E53E3E;/* 安全水位線 (紅) */
+            --border-color: #E2E8F0;   /* 淺灰邊框 */
+            --input-bg: #F8FAFC;       /* 輸入框淺底 */
+            --shadow: 0 4px 12px rgba(0, 0, 0, 0.03); /* 柔和陰影 */
+            
+            --positive-color: #38A169; /* 綠色 */
+            --negative-color: #E53E3E; /* 紅色 */
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0; padding: 20px;
+            -webkit-tap-highlight-color: transparent; 
+            line-height: 1.5;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+
+        /* Header */
+        header {
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 25px; padding-bottom: 15px; border-bottom: 1px solid var(--border-color);
+            flex-wrap: wrap; gap: 15px;
+        }
+        header h2 { 
+            font-size: 1.5rem; margin: 0; font-weight: 700; 
+            color: #2D3748; letter-spacing: 0.5px;
+        }
+        .status-badge {
+            background-color: #C6F6D5; color: #22543D; 
+            padding: 5px 10px; border-radius: 20px; 
+            font-size: 0.85em; font-weight: 600;
+            display: inline-flex; align-items: center; gap: 5px;
+        }
+        .status-badge::before {
+            content: ''; display: block; width: 6px; height: 6px; 
+            background-color: #38A169; border-radius: 50%;
+        }
+
+        /* Tabs */
+        .tabs { 
+            display: flex; gap: 10px; margin-bottom: 25px; 
+            border-bottom: 1px solid var(--border-color); 
+            overflow-x: auto; white-space: nowrap;
+            -webkit-overflow-scrolling: touch; 
+        }
+        .tab-btn {
+            padding: 12px 20px; background: transparent; border: none;
+            color: var(--text-sub); font-size: 1rem; cursor: pointer;
+            border-bottom: 3px solid transparent; transition: all 0.3s;
+            font-weight: 500; flex-shrink: 0;
+        }
+        .tab-btn:hover { color: var(--accent-color); }
+        .tab-btn.active { 
+            color: var(--accent-color); 
+            border-bottom-color: var(--accent-color); 
+            font-weight: 700; 
+        }
+        .tab-content { display: none; animation: fadeIn 0.4s ease; }
+        .tab-content.active { display: block; }
+
+        /* Control Panel */
+        .control-panel {
+            background-color: var(--card-bg); padding: 25px; border-radius: 16px;
+            margin-bottom: 25px; box-shadow: var(--shadow);
+            border: 1px solid var(--border-color);
+        }
+        .control-row {
+            display: flex; gap: 20px; flex-wrap: wrap; align-items: center;
+        }
+        .control-row + .control-row {
+            margin-top: 20px; padding-top: 20px; border-top: 1px dashed var(--border-color);
+        }
+        .section-title { 
+            font-size: 0.95em; color: var(--accent-color); font-weight: 700; 
+            width: 100%; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px;
+        }
+        
+        .input-group { display: flex; flex-direction: column; gap: 6px; flex: 1; min-width: 100px; }
+        .input-group label { font-size: 0.85em; color: var(--text-sub); font-weight: 500; }
+        .input-group input, .input-group select {
+            background: var(--input-bg); border: 1px solid var(--border-color); 
+            color: var(--text-color);
+            padding: 10px 12px; border-radius: 8px; width: 100%; text-align: center;
+            font-size: 1em; font-weight: 600; transition: border 0.2s;
+            box-sizing: border-box;
+        }
+        .input-group input:focus, .input-group select:focus {
+            outline: none; border-color: var(--accent-color); background: #FFF;
+        }
+        .input-group.checkbox-group {
+            flex-direction: row; align-items: center; gap: 12px; flex: 1 0 100%;
+            background: #FFFAF0; /* 淡金底 */
+            padding: 12px 15px; border-radius: 8px; border: 1px solid #FEEBC8;
+        }
+        .input-group.checkbox-group input { width: 20px; height: 20px; min-width: 20px; accent-color: var(--accent-color); cursor: pointer; }
+        .input-group.checkbox-group label { font-size: 1em; color: #744210; margin: 0; cursor: pointer; }
+
+        /* Time Filters */
+        .chart-header-row {
+            display: flex; justify-content: space-between; align-items: center; 
+            margin-bottom: 15px; flex-wrap: wrap; gap: 10px;
+        }
+        .time-filters {
+            display: flex; gap: 5px; background: #EDF2F7; 
+            padding: 4px; border-radius: 8px; 
+            overflow-x: auto; max-width: 100%;
+        }
+        .tf-btn {
+            background: transparent; border: none; color: #718096;
+            padding: 6px 12px; border-radius: 6px; cursor: pointer; 
+            font-size: 0.85em; font-weight: 600; transition: all 0.2s;
+            white-space: nowrap;
+        }
+        .tf-btn:hover { color: #4A5568; background-color: rgba(255,255,255,0.5); }
+        .tf-btn.active { 
+            background: #FFFFFF; color: var(--accent-color); 
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05); 
+        }
+
+        /* Stats Grid */
+        .grid-stats { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 15px; margin-bottom: 25px; 
+        }
+        .card { 
+            background-color: var(--card-bg); padding: 20px; border-radius: 16px; 
+            text-align: center; box-shadow: var(--shadow); border: 1px solid var(--border-color);
+            transition: transform 0.2s;
+        }
+        .card:hover { transform: translateY(-2px); }
+        .card h3 { margin: 0 0 8px 0; font-size: 0.9em; color: var(--text-sub); font-weight: 500; }
+        .card .value { font-size: 1.5em; font-weight: 700; margin: 5px 0; color: var(--text-color); }
+        .card .sub { font-size: 0.8em; color: var(--text-sub); margin-top: 4px; }
+        .positive { color: var(--positive-color) !important; } 
+        .negative { color: var(--negative-color) !important; }
+
+        /* Charts & Info Cards */
+        .chart-box, .info-card {
+            background-color: var(--card-bg); padding: 20px; border-radius: 16px; 
+            margin-bottom: 25px; box-shadow: var(--shadow); border: 1px solid var(--border-color);
+            overflow: hidden; 
+        }
+        .chart-responsive { width: 100%; }
+
+        /* Strategy Info Card Styles */
+        .info-card-header {
+            display: flex; align-items: center; gap: 15px; border-bottom: 1px solid var(--border-color);
+            padding-bottom: 15px; margin-bottom: 20px;
+        }
+        .strat-icon {
+            width: 50px; height: 50px; border-radius: 12px; 
+            display: flex; align-items: center; justify-content: center;
+            font-size: 1.5em; font-weight: bold; color: white;
+        }
+        .bg-kama { background: linear-gradient(135deg, #F5C518, #D69E2E); }
+        .bg-ceo { background: linear-gradient(135deg, #58A6FF, #2D3748); }
+        
+        .strat-title h3 { margin: 0; font-size: 1.4em; color: var(--text-color); }
+        .strat-title span { font-size: 0.9em; color: var(--text-sub); font-weight: 500; }
+        
+        .info-grid {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 30px;
+        }
+        .info-section h4 {
+            color: var(--accent-color); margin: 0 0 12px 0; font-size: 1.1em;
+            border-left: 4px solid var(--accent-color); padding-left: 10px;
+        }
+        .info-list { list-style: none; padding: 0; margin: 0; }
+        .info-list li {
+            position: relative; padding-left: 20px; margin-bottom: 10px; color: var(--text-color); font-size: 0.95em;
+        }
+        .info-list li::before {
+            content: '•'; color: var(--text-sub); font-weight: bold;
+            position: absolute; left: 0; top: 0;
+        }
+        .logic-box {
+            background: var(--input-bg); padding: 15px; border-radius: 8px;
+            font-family: 'Roboto Mono', monospace; font-size: 0.9em; color: var(--text-color);
+            border: 1px solid var(--border-color);
+        }
+        
+        /* Tables */
+        .table-container {
+            background-color: var(--card-bg); padding: 20px; border-radius: 16px; 
+            margin-bottom: 25px; box-shadow: var(--shadow); border: 1px solid var(--border-color);
+            overflow-x: auto; -webkit-overflow-scrolling: touch;
+        }
+        table { width: 100%; border-collapse: collapse; font-size: 0.95em; min-width: 600px; }
+        th { 
+            text-align: left; padding: 15px; border-bottom: 2px solid #EDF2F7; 
+            color: var(--text-sub); font-weight: 600; white-space: nowrap; letter-spacing: 0.5px;
+        }
+        td { padding: 15px; border-bottom: 1px solid #EDF2F7; color: var(--text-color); white-space: nowrap; }
+        tr:last-child td { border-bottom: none; }
+        tr:hover { background-color: #FAFAFA; }
+        .td-num { text-align: right; font-family: 'Roboto Mono', monospace; font-weight: 500; }
+        .rank-badge { 
+            background: var(--input-bg); color: var(--text-sub); padding: 4px 10px; 
+            border-radius: 12px; font-size: 0.85em; font-weight: 700; border: 1px solid var(--border-color);
+        }
+        tr:nth-child(1) .rank-badge { background: #FED7D7; color: #C53030; } 
+        tr:nth-child(2) .rank-badge { background: #FEEBC8; color: #C05621; } 
+        tr:nth-child(3) .rank-badge { background: #FEFCBF; color: #975A16; } 
+        
+        #error-box { 
+            background: #FED7D7; color: #C53030; padding: 15px; display: none; 
+            margin-bottom: 20px; border-radius: 8px; border: 1px solid #FEB2B2; 
+        }
+        #debug-console { 
+            margin-top: 30px; padding: 15px; background: #2D3748; color: #CBD5E0; 
+            font-family: monospace; font-size: 0.85em; border-radius: 8px; 
+            max-height: 100px; overflow-y: auto; 
+        }
+
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+        /* Mobile Adjustments */
+        @media (min-width: 768px) {
+            .section-title { width: 120px; margin-bottom: 0; }
+            .control-row { gap: 25px; }
+            .input-group { flex: initial; } 
+            .input-group.checkbox-group { flex: initial; background: #FFFAF0; padding: 10px 20px; }
+            .card .value { font-size: 1.8em; }
+            .grid-stats { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <header>
+        <div>
+            <h2>📊 台指期趨勢追蹤</h2>
+            <div style="font-size: 0.85em; color: #A0AEC0; margin-top: 5px;">Data Source: GitHub Raw</div>
+        </div>
+        <div style="text-align: right;">
+            <span id="status-badge" class="status-badge">Initialize...</span>
+            <div id="next-update-text" style="font-size: 0.8em; color: #A0AEC0; margin-top: 5px;">Waiting for scheduler</div>
+        </div>
+    </header>
+
+    <div id="error-box"></div>
+
+    <div class="tabs">
+        <button class="tab-btn active" onclick="switchTab('sim')">🛠️ 投資組合儀錶板</button>
+        <button class="tab-btn" onclick="switchTab('monitor')">📈 單一策略監控</button>
+        <button class="tab-btn" onclick="switchTab('intro')">📘 策略簡介</button>
+    </div>
+
+    <!-- PAGE 1: Simulation -->
+    <div id="sim" class="tab-content active">
+        <!-- Control Panel -->
+        <div class="control-panel">
+            <div class="control-row">
+                <div class="section-title">帳戶設定</div>
+                <div class="input-group">
+                    <label>初始資金 (NTD)</label>
+                    <input type="number" id="init_capital" value="1000000" step="10000" onchange="renderCharts()">
+                </div>
+                <div class="input-group">
+                    <label>交易商品</label>
+                    <select id="contract_type" onchange="renderCharts()">
+                        <option value="50" selected>小台 (MTX)</option>
+                        <option value="200">大台 (TX)</option>
+                    </select>
+                </div>
+                <div class="input-group checkbox-group">
+                    <input type="checkbox" id="use_fixed_lev" onchange="renderCharts()">
+                    <label for="use_fixed_lev">固定槓桿比例</label>
+                </div>
+                <div class="input-group">
+                    <label>目標倍數</label>
+                    <input type="number" id="target_lev" value="6" step="0.5" min="1" onchange="renderCharts()">
+                </div>
+                <div class="input-group">
+                    <label>安全水位係數 (1/x)</label>
+                    <!-- Updated to 22.5 (1.5x of 15) -->
+                    <input type="number" id="safe_factor" value="12.5" step="0.5" min="1" onchange="renderCharts()" title="安全水位 = 合約總值 / 係數">
+                </div>
+            </div>
+
+            <div class="control-row">
+                <div class="section-title">策略口數</div>
+                <div class="input-group"><label>ceo_L</label><input type="number" id="w_ceo_l" value="4" step="1" min="0" onchange="renderCharts()"></div>
+                <div class="input-group"><label>ceo_S</label><input type="number" id="w_ceo_s" value="2" step="1" min="0" onchange="renderCharts()"></div>
+                <div class="input-group"><label>kama_L</label><input type="number" id="w_kama" value="1" step="1" min="0" onchange="renderCharts()"></div>
+                <div style="width: 100%; color: #A0AEC0; font-size: 0.85em; margin-top: -5px;">
+                    <span id="lev-hint" style="display:none;">(啟用固定槓桿: 每週依淨值調整口數)</span>
+                </div>
+            </div>
+
+            <div class="control-row">
+                <div class="section-title">Benchmark</div>
+                <div class="input-group"><label>口數</label><input type="number" id="w_bench" value="4" step="1" min="1" onchange="renderCharts()"></div>
+                <div style="margin-left: auto; color: #A0AEC0; font-size: 0.85em;">
+                    <span id="bench-hint" style="display:none;">(固定口數模式)</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="grid-stats" id="sim-stats"></div>
+        
+        <div class="chart-box">
+            <!-- Time Range Filters -->
+            <div class="chart-header-row">
+                <div style="flex-grow:1">
+                    <h3 style="margin:0; color: #4A5568; font-size: 1.1em;">帳戶權益曲線 (含安全水位)</h3>
+                </div>
+                <div class="time-filters" id="sim-filters">
+                    <button class="tf-btn" onclick="setTimeRange('6M', this, 'sim')">6M</button>
+                    <button class="tf-btn" onclick="setTimeRange('YTD', this, 'sim')">YTD</button>
+                    <button class="tf-btn" onclick="setTimeRange('1Y', this, 'sim')">1Y</button>
+                    <button class="tf-btn" onclick="setTimeRange('2Y', this, 'sim')">2Y</button>
+                    <button class="tf-btn" onclick="setTimeRange('3Y', this, 'sim')">3Y</button>
+                    <button class="tf-btn active" onclick="setTimeRange('ALL', this, 'sim')">All Time</button>
+                </div>
+            </div>
+            <div id="sim_chart" class="chart-responsive"></div>
+        </div>
+
+        <div class="chart-box">
+            <h3 style="margin:0 0 15px 0; color: #4A5568; font-size:1.1em;">⚖️ 槓桿比例變化</h3>
+            <div id="leverage_chart" class="chart-responsive"></div>
+        </div>
+
+        <div class="table-container">
+            <h3 style="margin-top: 0; color: #4A5568; margin-bottom: 15px;">📉 前 10 大回檔 (Top 10 Drawdowns)</h3>
+            <table id="dd-table">
+                <thead>
+                    <tr>
+                        <th style="width:50px;">#</th>
+                        <th>Peak (高點)</th>
+                        <th>Valley (低谷)</th>
+                        <th>End (創新高)</th>
+                        <th class="td-num">Max Loss (金額)</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
+        <div class="chart-box">
+            <h3 style="margin:0 0 15px 0; color: #4A5568; font-size:1.1em;">📅 季度績效分析</h3>
+            <div id="quarterly_chart" class="chart-responsive"></div>
+        </div>
+    </div>
+
+    <!-- PAGE 2: Monitor -->
+    <div id="monitor" class="tab-content">
+        <div class="chart-box" style="margin-bottom: 15px; padding: 10px;">
+             <div class="chart-header-row" style="margin-bottom: 0;">
+                <div style="flex-grow:1">
+                    <h3 style="margin:0; color: #4A5568; font-size: 1.1em;">時間區間篩選</h3>
+                </div>
+                <div class="time-filters" id="monitor-filters">
+                    <button class="tf-btn" onclick="setTimeRange('6M', this, 'monitor')">6M</button>
+                    <button class="tf-btn" onclick="setTimeRange('YTD', this, 'monitor')">YTD</button>
+                    <button class="tf-btn" onclick="setTimeRange('1Y', this, 'monitor')">1Y</button>
+                    <button class="tf-btn" onclick="setTimeRange('2Y', this, 'monitor')">2Y</button>
+                    <button class="tf-btn" onclick="setTimeRange('3Y', this, 'monitor')">3Y</button>
+                    <button class="tf-btn active" onclick="setTimeRange('ALL', this, 'monitor')">All Time</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="grid-stats" id="monitor-stats"></div>
+        <div class="chart-box">
+            <h3 style="margin:0 0 15px 0; color: #4A5568; font-size:1.1em;">個別策略累積損益</h3>
+            <div id="monitor_equity" class="chart-responsive"></div>
+        </div>
+        <div class="chart-box">
+            <h3 style="margin:0 0 15px 0; color: #4A5568; font-size:1.1em;">策略回撤 (Drawdown)</h3>
+            <div id="monitor_dd" class="chart-responsive"></div>
+        </div>
+    </div>
+
+    <!-- PAGE 3: Strategy Introduction -->
+    <div id="intro" class="tab-content">
+        <!-- Card 1: KAMA Cloud -->
+        <div class="info-card">
+            <div class="info-card-header">
+                <div class="strat-icon bg-kama">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 6l-9.5 9.5-5-5L1 18"/><path d="M17 6h6v6"/></svg>
+                </div>
+                <div class="strat-title">
+                    <h3>KAMA Cloud 趨勢雲策略</h3>
+                    <span>Trend Following | KAMA Adaptive | Long Only</span>
+                </div>
+            </div>
+            <div class="info-grid">
+                <div class="info-section">
+                    <h4>💡 核心概念 (Concept)</h4>
+                    <ul class="info-list">
+                        <li>利用 <strong>20 條 KAMA 均線 (Period 5~100)</strong> 構成的「網狀結構」來捕捉趨勢。</li>
+                        <li><strong>自適應特性</strong>：KAMA 在盤整時走平（過濾雜訊），在趨勢噴出時快速跟隨。</li>
+                        <li><strong>右側交易</strong>：不預測底部，需等待均線發散確認後才進場。</li>
+                    </ul>
+                </div>
+                <div class="info-section">
+                    <h4>⚙️ 交易邏輯 (Logic)</h4>
+                    <div class="logic-box">
+                        <strong>[進場條件] (同時滿足)</strong><br>
+                        1. 多頭排列: TotalDistance > 0<br>
+                        2. 黃金交叉: Cloud > CloudMA<br>
+                        3. 動能轉強: HistLine > 0<br><br>
+                        <strong>[出場條件]</strong><br>
+                        1. 死亡交叉: Cloud < CloudMA
+                    </div>
+                </div>
+                <div class="info-section">
+                    <h4>🚀 策略優勢</h4>
+                    <ul class="info-list">
+                        <li><strong>抗震盪</strong>：透過 "totalDistance" 加權，盤整時雲帶收縮，不易被洗出場。</li>
+                        <li><strong>爆發力</strong>：趨勢越強，雲帶擴張越快，能緊抱強勢波段。</li>
+                        <li><strong>可視化</strong>：雲帶 (Cloud) 與均線 (MA) 的距離直接反映市場熱度。</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <!-- Card 2: Chandelier Exit -->
+        <div class="info-card">
+            <div class="info-card-header">
+                <div class="strat-icon bg-ceo">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+                </div>
+                <div class="strat-title">
+                    <h3>Chandelier Exit Oscillator 吊燈策略</h3>
+                    <span>Volatility Breakout | ATR Trailing Stop | Long/Short</span>
+                </div>
+            </div>
+            <div class="info-grid">
+                <div class="info-section">
+                    <h4>💡 核心概念 (Concept)</h4>
+                    <ul class="info-list">
+                        <li><strong>"吊燈止損"</strong>：止損點像吊燈掛在天花板(最高價)上，價格創新高就拉高，回落則不動。</li>
+                        <li>以 <strong>ATR (波動率)</strong> 作為安全距離，市場波動大時放寬，波動小時收緊。</li>
+                        <li>此版本加入了 <strong>平滑機制</strong> (High與Close取平均) 以減少假突破。</li>
+                    </ul>
+                </div>
+                <div class="info-section">
+                    <h4>⚙️ 交易邏輯 (Logic)</h4>
+                    <div class="logic-box">
+                        <strong>[多單訊號]</strong><br>
+                        收盤價 > (波段低點 + ATR * 倍數)<br>
+                        <span style="color:#8C8C8C">// 代表價格從底部反彈超過安全距離</span><br><br>
+                        <strong>[空單訊號]</strong><br>
+                        收盤價 < (波段高點 - ATR * 倍數)<br>
+                        <span style="color:#8C8C8C">// 代表價格從高點回落超過安全距離</span>
+                    </div>
+                </div>
+                <div class="info-section">
+                    <h4>🆚 與 Supertrend 比較</h4>
+                    <ul class="info-list">
+                        <li><strong>更靈敏</strong>：Chandelier 錨定「極值(High/Low)」，Supertrend 錨定「均值」。</li>
+                        <li><strong>利潤保護佳</strong>：在趨勢反轉初期（V轉），Chandelier 通常能比 Supertrend 更早出場鎖住獲利。</li>
+                        <li><strong>風險</strong>：在強烈震盪盤中，因貼著高點移動，可能較容易被掃出場。</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="debug-console">System Ready.</div>
+</div>
+
+<script>
+    // GitHub Raw URL
+    const CSV_FILE = 'https://raw.githubusercontent.com/miYuz/data-0001/refs/heads/main/txf_result.csv';
+    
+    let globalData = [];
+    let lastUpdatedMinute = -1;
+    
+    let currentRangePeriodSim = 'ALL'; 
+    let currentRangePeriodMonitor = 'ALL';
+
+    // Colors for Creamy Theme
+    const COLOR_PORTFOLIO = '#D69E2E'; 
+    const COLOR_BENCHMARK = '#2D3748'; 
+    const COLOR_POSITIVE = '#38A169';
+    const COLOR_NEGATIVE = '#E53E3E';
+    const COLOR_SAFE_LINE = '#E53E3E';
+
+    const isMobile = window.innerWidth < 768;
+
+    function switchTab(tabId) {
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        // Simple logic to find index based on id
+        let idx = 0;
+        if(tabId === 'monitor') idx = 1;
+        if(tabId === 'intro') idx = 2;
+        document.querySelectorAll('.tab-btn')[idx].classList.add('active');
+
+        document.querySelectorAll('.tab-content').forEach(d => {
+            d.classList.remove('active'); d.style.display = 'none';
+        });
+        const target = document.getElementById(tabId);
+        target.classList.add('active'); target.style.display = 'block';
+
+        if (globalData.length > 0 && tabId !== 'intro') {
+            setTimeout(() => {
+                renderCharts();
+                window.dispatchEvent(new Event('resize'));
+            }, 100);
+        }
+    }
+
+    function setTimeRange(period, btn, page) {
+        const containerId = page === 'sim' ? 'sim-filters' : 'monitor-filters';
+        const container = document.getElementById(containerId);
+        container.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active'));
+        if(btn) btn.classList.add('active');
+        
+        if (page === 'sim') {
+            currentRangePeriodSim = period;
+        } else {
+            currentRangePeriodMonitor = period;
+        }
+        renderCharts();
+    }
+
+    async function fetchData() {
+        try {
+            updateStatus('loading', 'Updating...');
+            // Add timestamp to prevent caching from GitHub Raw
+            const data = await d3.csv(CSV_FILE + '?t=' + new Date().getTime());
+            if (!data || data.length === 0) throw new Error("CSV is empty");
+
+            globalData = data.map(row => {
+                let newRow = {};
+                for (let k in row) newRow[k.trim().replace(/^\ufeff/, '')] = row[k];
+                return newRow;
+            });
+
+            renderCharts();
+            updateStatus('success', 'Updated: ' + new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}));
+        } catch (e) {
+            console.error(e);
+            showError(e.message);
+            updateStatus('error', 'Error');
+        }
+    }
+
+    function renderCharts() {
+        if (globalData.length === 0) return;
+        
+        // Only render visible charts to save resources
+        if (document.getElementById('sim').classList.contains('active')) {
+            renderSimulation();
+        } else if (document.getElementById('monitor').classList.contains('active')) {
+            renderMonitor();
+        }
+    }
+
+    // Helper function to filter data based on period
+    function filterDataByPeriod(data, period) {
+        if (period === 'ALL' || !data.length) return [...data];
+        
+        const lastDate = new Date(data[data.length - 1].ts);
+        let startDate = new Date(lastDate);
+        
+        switch(period) {
+            case 'YTD': startDate = new Date(lastDate.getFullYear(), 0, 1); break;
+            case '6M': startDate.setMonth(startDate.getMonth() - 6); break;
+            case '1Y': startDate.setFullYear(startDate.getFullYear() - 1); break;
+            case '2Y': startDate.setFullYear(startDate.getFullYear() - 2); break;
+            case '3Y': startDate.setFullYear(startDate.getFullYear() - 3); break;
+        }
+        return data.filter(d => new Date(d.ts) >= startDate);
+    }
+
+    function renderSimulation() {
+        const initCapital = parseFloat(document.getElementById('init_capital').value) || 1000000;
+        const multiplier = parseFloat(document.getElementById('contract_type').value) || 50; 
+        const useFixedLev = document.getElementById('use_fixed_lev').checked;
+        const targetLev = parseFloat(document.getElementById('target_lev').value) || 6; 
+        const safeFactor = parseFloat(document.getElementById('safe_factor').value) || 12;
+
+        document.getElementById('lev-hint').style.display = useFixedLev ? 'inline' : 'none';
+        document.getElementById('bench-hint').style.display = useFixedLev ? 'none' : 'inline';
+        document.getElementById('bench-hint').innerText = useFixedLev ? '' : '(固定)';
+
+        const base_w_ceo_l = parseInt(document.getElementById('w_ceo_l').value) || 0;
+        const base_w_ceo_s = parseInt(document.getElementById('w_ceo_s').value) || 0;
+        const base_w_kama = parseInt(document.getElementById('w_kama').value) || 0;
+        const base_sum = base_w_ceo_l + base_w_ceo_s + base_w_kama;
+        const base_w_bench = parseInt(document.getElementById('w_bench').value) || 1;
+
+        // Data Slicing
+        let simData = filterDataByPeriod(globalData, currentRangePeriodSim);
+
+        if (simData.length === 0) return;
+
+        const times = simData.map(d => d.ts);
+
+        let benchKey = 'TXF_caa';
+        if (!simData[0].hasOwnProperty('TXF_caa')) {
+            if (simData[0].hasOwnProperty('TXF_abs')) benchKey = 'TXF_abs';
+            else benchKey = null;
+        }
+
+        // Initialization
+        let portEquityCurve = [], benchEquityCurve = [], portHighWatermark = [], leverageCurve = [];
+        let safeLevelCurve = []; 
+        let currPortEquity = initCapital, currBenchEquity = initCapital, maxEquity = initCapital;
+        let curr_w1 = base_w_kama, curr_w2 = base_w_ceo_l, curr_w3 = base_w_ceo_s, curr_bench_contracts = base_w_bench;
+        let lastWeekNum = -1;
+        let prevBenchPrice = benchKey ? (parseFloat(simData[0][benchKey]) || 0) : 0;
+        
+        let dailyPnLMap = {}, dateKeyOrder = [], quarterlyStats = {}; 
+
+        // Simulation Loop
+        simData.forEach((row, i) => {
+            let dateObj = new Date(row.ts);
+            let currentPrice = benchKey ? (parseFloat(row[benchKey]) || 0) : 0;
+
+            if (useFixedLev && !isNaN(dateObj.getTime())) {
+                let currentWeekNum = getWeekNumber(dateObj);
+                if (currentWeekNum !== lastWeekNum || i === 0) {
+                    lastWeekNum = currentWeekNum;
+                    if (currentPrice > 0) {
+                        if (base_sum > 0) {
+                            let targetExposure = currPortEquity * targetLev;
+                            let contractVal = currentPrice * multiplier;
+                            let k = Math.round((targetExposure / contractVal) / base_sum);
+                            if (k < 1) k = 1; 
+                            curr_w1 = base_w_kama * k;
+                            curr_w2 = base_w_ceo_l * k;
+                            curr_w3 = base_w_ceo_s * k;
+                        }
+                        let benchTargetExposure = currPortEquity * targetLev; 
+                        let benchContractVal = currentPrice * multiplier;
+                        let targetBenchContracts = Math.round(benchTargetExposure / benchContractVal);
+                        if (targetBenchContracts < 1) targetBenchContracts = 1;
+                        curr_bench_contracts = targetBenchContracts;
+                    }
+                }
+            } else if (!useFixedLev) {
+                curr_bench_contracts = base_w_bench;
+            }
+
+            let p1 = (parseFloat(row.kama_L) || 0) * curr_w1;
+            let p2 = (parseFloat(row.ceo_L) || 0) * curr_w2;
+            let p3 = (parseFloat(row.ceo_S) || 0) * curr_w3;
+            let pointPnL = p1 + p2 + p3;
+            let moneyPnL = pointPnL * multiplier;
+
+            let priceDelta = currentPrice - prevBenchPrice;
+            let benchMoneyPnL = priceDelta * curr_bench_contracts * multiplier;
+            if (i === 0) benchMoneyPnL = 0; 
+            prevBenchPrice = currentPrice;
+
+            currPortEquity += moneyPnL;
+            currBenchEquity += benchMoneyPnL;
+            if(currPortEquity > maxEquity) maxEquity = currPortEquity;
+
+            portEquityCurve.push(currPortEquity);
+            benchEquityCurve.push(currBenchEquity);
+            portHighWatermark.push(maxEquity);
+
+            let totalContractsHeld = Math.abs(curr_w1) + Math.abs(curr_w2) + Math.abs(curr_w3);
+            let exposure = currentPrice * totalContractsHeld * multiplier;
+            let lev = (currPortEquity > 0) ? (exposure / currPortEquity) : 0;
+            leverageCurve.push(lev);
+
+            // Safe Level: Max(Long, Short) * ContractVal / Factor
+            let totalLongs = Math.abs(curr_w1) + Math.abs(curr_w2);
+            let totalShorts = Math.abs(curr_w3);
+            let maxSideContracts = Math.max(totalLongs, totalShorts);
+            
+            let contractValue = currentPrice * multiplier;
+            let safeLevelVal = (maxSideContracts * contractValue) / safeFactor;
+            safeLevelCurve.push(safeLevelVal);
+
+            let dateStr = row.ts.split(' ')[0]; 
+            if(!dailyPnLMap[dateStr]) {
+                dailyPnLMap[dateStr] = 0;
+                dateKeyOrder.push(dateStr);
+            }
+            dailyPnLMap[dateStr] += moneyPnL;
+
+            if (!isNaN(dateObj)) {
+                let y = dateObj.getFullYear();
+                let q = Math.floor(dateObj.getMonth() / 3) + 1;
+                let key = `${y}-Q${q}`;
+                if (!quarterlyStats[key]) quarterlyStats[key] = { port: 0, bench: 0 };
+                quarterlyStats[key].port += moneyPnL;
+                quarterlyStats[key].bench += benchMoneyPnL;
+            }
+        });
+
+        let ddPeriods = calculateDrawdowns(times, portEquityCurve);
+        renderDrawdownTable(ddPeriods);
+
+        let dailyReturns = [];
+        let tempEquity = initCapital;
+        dateKeyOrder.forEach(date => {
+            let dPnL = dailyPnLMap[date];
+            let ret = (tempEquity > 0) ? (dPnL / tempEquity) : 0;
+            dailyReturns.push(ret);
+            tempEquity += dPnL;
+        });
+
+        let sumRet = dailyReturns.reduce((a,b)=>a+b, 0);
+        let meanRet = sumRet / dailyReturns.length;
+        let sumSqDiff = dailyReturns.reduce((a,b) => a + Math.pow(b - meanRet, 2), 0);
+        let stdRet = Math.sqrt(sumSqDiff / dailyReturns.length);
+        let sharpe = (stdRet > 0) ? (meanRet / stdRet) * Math.sqrt(252) : 0;
+
+        let sumSqDown = dailyReturns.reduce((a, b) => a + (b < 0 ? Math.pow(b, 2) : 0), 0);
+        let downDev = Math.sqrt(sumSqDown / dailyReturns.length);
+        let sortino = (downDev > 0) ? (meanRet / downDev) * Math.sqrt(252) : 0;
+
+        const finalPortEquity = portEquityCurve[portEquityCurve.length - 1];
+        const finalBenchEquity = benchEquityCurve[benchEquityCurve.length - 1];
+        const totalProfit = finalPortEquity - initCapital;
+        let mddMoney = ddPeriods.length > 0 ? ddPeriods[0].maxLoss : 0;
+
+        document.getElementById('sim-stats').innerHTML = `
+            <div class="card" style="border-top: 4px solid ${COLOR_PORTFOLIO}">
+                <h3>期末淨值</h3>
+                <div class="value ${finalPortEquity>=initCapital?'positive':'negative'}">
+                    $${Math.round(finalPortEquity/10000)}<span style="font-size:0.6em; color:var(--text-sub)">萬</span>
+                </div>
+                <div class="sub">+$${Math.round(totalProfit).toLocaleString()}</div>
+            </div>
+            <div class="card" style="border-top: 4px solid ${COLOR_NEGATIVE}">
+                <h3>最大回撤 (MDD)</h3>
+                <div class="value negative">$${Math.round(mddMoney/10000)}<span style="font-size:0.6em; color:var(--text-sub)">萬</span></div>
+                <div class="sub">Risk</div>
+            </div>
+            <div class="card" style="border-top: 4px solid #9C27B0">
+                <h3>風險指標</h3>
+                <div class="value">${sharpe.toFixed(2)}</div>
+                <div class="sub">Sharpe / Sortino: ${sortino.toFixed(2)}</div>
+            </div>
+            <div class="card" style="border-top: 4px solid ${COLOR_BENCHMARK}">
+                <h3>Benchmark</h3>
+                <div class="value ${finalBenchEquity>=initCapital?'positive':'negative'}">
+                    $${Math.round(finalBenchEquity/10000)}<span style="font-size:0.6em; color:var(--text-sub)">萬</span>
+                </div>
+                <div class="sub">
+                    ${useFixedLev ? '(Lev ' + targetLev + 'x)' : '(' + base_w_bench + '口)'}
+                </div>
+            </div>
+        `;
+
+        // --- Charts ---
+        const isMobile = window.innerWidth < 768;
+        const chartHeight = isMobile ? 350 : 500;
+        const levChartHeight = isMobile ? 200 : 250;
+
+        let tracesEquity = [
+            { x: times, y: portEquityCurve, name: 'Portfolio', mode: 'lines', line: { color: COLOR_PORTFOLIO, width: 2 }, fill: 'tozeroy', fillcolor: 'rgba(214, 158, 46, 0.1)' },
+            { x: times, y: benchEquityCurve, name: 'Benchmark', mode: 'lines', line: { color: COLOR_BENCHMARK, width: 1.5 } },
+            { x: times, y: portHighWatermark, name: 'High', mode: 'lines', line: { color: COLOR_POSITIVE, width: 1, dash: 'dot' }, opacity: 0.7 },
+            // Safe Level Trace
+            { x: times, y: safeLevelCurve, name: 'Safe Level', mode: 'lines', line: { color: COLOR_SAFE_LINE, width: 1.5, dash: 'dash' }, opacity: 0.8 }
+        ];
+
+        let layoutEq = getLayout('', chartHeight);
+        layoutEq.yaxis.title = '金額 (NTD)';
+        layoutEq.margin.r = 40; 
+
+        if (useFixedLev && benchKey) {
+            let txfPrices = simData.map(d => parseFloat(d[benchKey]) || 0);
+            tracesEquity.push({
+                x: times, y: txfPrices, name: 'TXF', 
+                yaxis: 'y2', mode: 'lines', 
+                line: { color: '#A0AEC0', width: 1 }, opacity: 0.4
+            });
+            
+            layoutEq.yaxis2 = {
+                title: 'Index',
+                overlaying: 'y', side: 'right',
+                gridcolor: 'rgba(0,0,0,0)',
+                tickfont: { color: '#A0AEC0' },
+                titlefont: { color: '#A0AEC0' },
+                showgrid: false
+            };
+            layoutEq.margin.r = isMobile ? 50 : 80; 
+        }
+
+        layoutEq.margin.t = isMobile ? 30 : 50;
+        layoutEq.legend = { orientation: 'h', y: isMobile ? 1.1 : 1.1, x: 0 };
+        
+        Plotly.newPlot('sim_chart', tracesEquity, layoutEq);
+
+        let traceLev = [{
+            x: times, y: leverageCurve, name: 'Leverage',
+            type: 'scatter', mode: 'lines', fill: 'tozeroy',
+            line: { color: '#9C27B0', width: 1.5 }, fillcolor: 'rgba(156, 39, 176, 0.2)'
+        }];
+        if(useFixedLev) {
+            traceLev.push({
+                x: [times[0], times[times.length-1]], y: [targetLev, targetLev],
+                name: 'Target', mode: 'lines', line: { color: '#9C27B0', width: 1, dash: 'dash' }
+            });
+        }
+        let layoutLev = getLayout('', levChartHeight);
+        layoutLev.yaxis.title = '倍數 (x)';
+        Plotly.newPlot('leverage_chart', traceLev, layoutLev);
+
+        renderQuarterlyChart(quarterlyStats, isMobile);
+    }
+
+    function getWeekNumber(d) {
+        d = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+        d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay()||7));
+        var yearStart = new Date(Date.UTC(d.getUTCFullYear(),0,1));
+        var weekNo = Math.ceil(( ( (d - yearStart) / 86400000) + 1)/7);
+        return d.getUTCFullYear() + "-" + weekNo;
+    }
+
+    function calculateDrawdowns(times, equity) {
+        let periods = [];
+        let peak = equity[0];
+        let peakIdx = 0;
+        let currentDD = null; 
+        for (let i = 0; i < equity.length; i++) {
+            if (equity[i] >= peak) {
+                if (currentDD) {
+                    currentDD.endIdx = i;
+                    periods.push(currentDD);
+                    currentDD = null;
+                }
+                peak = equity[i];
+                peakIdx = i;
+            } else {
+                let ddAmount = equity[i] - peak; 
+                if (!currentDD) {
+                    currentDD = { startIdx: peakIdx, valleyIdx: i, maxLoss: ddAmount, endIdx: -1 };
+                } else {
+                    if (ddAmount < currentDD.maxLoss) {
+                        currentDD.maxLoss = ddAmount;
+                        currentDD.valleyIdx = i;
+                    }
+                }
+            }
+        }
+        if(currentDD) periods.push(currentDD);
+        let result = periods.map(p => {
+            return {
+                start: times[p.startIdx].split(' ')[0], 
+                valley: times[p.valleyIdx].split(' ')[0],
+                end: (p.endIdx !== -1) ? times[p.endIdx].split(' ')[0] : 'Open',
+                maxLoss: p.maxLoss
+            };
+        });
+        result.sort((a, b) => a.maxLoss - b.maxLoss);
+        return result.slice(0, 10); 
+    }
+
+    function renderDrawdownTable(data) {
+        const tbody = document.querySelector('#dd-table tbody');
+        tbody.innerHTML = '';
+        data.forEach((d, i) => {
+            let row = `<tr>
+                <td><span class="rank-badge">${i+1}</span></td>
+                <td>${d.start}</td>
+                <td>${d.valley}</td>
+                <td>${d.end}</td>
+                <td class="td-num negative">${Math.round(d.maxLoss/10000)}萬</td>
+            </tr>`;
+            tbody.innerHTML += row;
+        });
+    }
+
+    function renderQuarterlyChart(stats, isMobile) {
+        let keys = Object.keys(stats).sort();
+        let xVal = keys;
+        let yPort = keys.map(k => stats[k].port);
+        let yBench = keys.map(k => stats[k].bench);
+        let trace1 = { x: xVal, y: yPort, name: 'Port', type: 'bar', marker: { color: COLOR_PORTFOLIO } };
+        let trace2 = { x: xVal, y: yBench, name: 'Bench', type: 'bar', marker: { color: COLOR_BENCHMARK, opacity: 0.3 } };
+        let layout = {
+            paper_bgcolor: '#FFFFFF', plot_bgcolor: '#FFFFFF', font: { color: '#4A5568' },
+            xaxis: { gridcolor: '#EDF2F7', tickangle: -45 }, yaxis: { gridcolor: '#EDF2F7', title: '損益' },
+            margin: { t: 30, l: 40, r: 20, b: 60 }, barmode: 'group', 
+            legend: { orientation: 'h', y: 1.1 },
+            height: isMobile ? 300 : 350
+        };
+        Plotly.newPlot('quarterly_chart', [trace1, trace2], layout);
+    }
+
+    function renderMonitor() {
+        const strategies = ['kama_L', 'ceo_L', 'ceo_S'];
+        const colors = ['#3182CE', '#D69E2E', '#38A169'];
+        const times = globalData.map(d => d.ts);
+        const isMobile = window.innerWidth < 768;
+        const height = isMobile ? 300 : 400;
+
+        // Data Slicing for Monitor using helper
+        let monitorData = filterDataByPeriod(globalData, currentRangePeriodMonitor);
+        
+        if (monitorData.length === 0) return;
+        
+        const monitorTimes = monitorData.map(d => d.ts);
+
+        let tracesEq=[], tracesDD=[], statsHTML='';
+        strategies.forEach((strat, idx) => {
+            if(!monitorData[0].hasOwnProperty(strat)) return;
+            
+            let pnl = monitorData.map(d => parseFloat(d[strat])||0);
+            let cum = []; 
+            pnl.reduce((a,b,i)=>cum[i]=a+b, 0);
+            
+            // Calculate MDD for this period
+            let maxP = -Infinity;
+            let dd = cum.map(v => { 
+                if(v > maxP) maxP = v; 
+                return v - maxP; 
+            });
+            let mdd = Math.min(...dd);
+
+            tracesEq.push({ x:monitorTimes, y:cum, name:strat, line:{color:colors[idx]} });
+            tracesDD.push({ x:monitorTimes, y:dd, name:strat, fill:'tozeroy', line:{color:colors[idx]} });
+            
+            statsHTML += `<div class="card" style="border-top:3px solid ${colors[idx]}">
+                <h3>${strat}</h3>
+                <div class="value ${cum[cum.length-1]>=0?'positive':'negative'}">${Math.round(cum[cum.length-1]).toLocaleString()}</div>
+                <div class="sub">MDD: ${Math.round(mdd)}</div>
+            </div>`;
+        });
+        
+        document.getElementById('monitor-stats').innerHTML = statsHTML;
+        Plotly.newPlot('monitor_equity', tracesEq, getLayout('', height));
+        Plotly.newPlot('monitor_dd', tracesDD, getLayout('', isMobile ? 250 : 300));
+    }
+
+    function getLayout(title, height) {
+        return {
+            title: { text: title, font: { size: 14 } }, 
+            paper_bgcolor: '#FFFFFF', plot_bgcolor: '#FFFFFF',
+            font: { color: '#4A5568', size: 11 }, 
+            xaxis: { gridcolor: '#EDF2F7' }, yaxis: { gridcolor: '#EDF2F7' },
+            margin: { t: 40, l: 40, r: 20, b: 30 }, 
+            hovermode: 'x unified', 
+            legend: { orientation: 'h', y: 1.1 },
+            height: height
+        };
+    }
+
+    function updateStatus(type, msg) {
+        const b = document.getElementById('status-badge');
+        b.innerText = msg;
+        b.style.backgroundColor = type==='loading'?'#FEFCBF':(type==='success'?'#C6F6D5':'#FED7D7');
+        b.style.color = type==='loading'?'#975A16':(type==='success'?'#22543D':'#C53030');
+    }
+    function showError(msg) {
+        document.getElementById('error-box').style.display='block';
+        document.getElementById('error-box').innerHTML = `<strong>Error:</strong> ${msg}`;
+    }
+
+    setInterval(() => {
+        const m = new Date().getMinutes();
+        const info = (m<10)?'10':(m<40)?'40':'下一小時';
+        document.getElementById('next-update-text').innerText = `目標: ${info}分`;
+        if((m===10||m===40) && m!==lastUpdatedMinute) { lastUpdatedMinute=m; fetchData(); }
+    }, 1000);
+
+    fetchData();
+</script>
+</body>
+</html>
